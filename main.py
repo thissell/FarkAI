@@ -1,7 +1,7 @@
 from take2 import Player, GameState, GameView, GameController, PlayerActor
 from neural import train, SimpleAIActor
 
-train(1000)
+train(10000)
 
 actor1 = PlayerActor(0)
 player1 = Player("Dumb")
