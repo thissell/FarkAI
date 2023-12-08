@@ -21,6 +21,19 @@ class GameState:
         self.held = set()
         self.round_score = 0
         self.turn = 0
+        self.move_num = 1
+
+    def make_copy(self):
+        copy = GameState()
+
+        copy.players = [Player("this")]
+        copy.dice = [i for i in self.dice]
+        copy.held = self.held.copy()
+        copy.round_score = self.round_score
+        copy.turn = self.turn
+        copy.move_num = self.move_num
+
+        return copy
 
     def get_score(self, handset=None):
         if handset is None:
@@ -98,9 +111,17 @@ class GameState:
     
     def get_current_player(self) -> Player:
         return self.players[self.turn]
+
+    def inc_move_num(self):
+        self.move_num += 1
+
+    def reset_move_num(self):
+        self.move_num = 1
     
     def to_vector(self, player_id):
-        t_score = self.players[player_id].score
+        h_score = (self.get_hand_score()[0])/8000
+        r_score = (self.get_round_score())/8000
+        move_num = 1 / self.move_num
 
         d = ""
         for i in range(0, 5):
@@ -117,6 +138,10 @@ class GameState:
                 v.append(1)
             else:
                 v.append(0)
+
+        v.append(h_score)
+        v.append(r_score)
+        v.append(move_num)
 
         return v
 
@@ -144,6 +169,16 @@ class GameState:
             self.held = self.held.union(tomove)
 
         return True
+
+    def can_hold_dice(self, tomove: set[int]):
+            if self.held.intersection(tomove) != set():
+                return False
+
+            move_score, all_score = self.get_score(tomove)
+            if not all_score:
+                return False
+
+            return True
 
     # Rolls any Dice given
     def roll_dice_unsafe(self, roll_list: set[int] = None):
@@ -312,6 +347,32 @@ class GameController:
         state = self.get_current_state()
         state.roll_dice_unsafe()
 
+    def get_is_valid(self, act):
+        state = self.get_current_state()
+
+        if act == 1:
+            return False
+
+        if not act == 0:
+            num_set = set()
+            q = "{0:b}".format(act - 1).zfill(6)
+            for i, v in enumerate(q):
+                if v == '1':
+                    num_set.add(5 - i)
+
+            if not state.can_hold_dice(num_set):
+                return False
+
+        return True
+
+    def get_valid_options(self):
+        opts = []
+        for i in range(64):
+            if self.get_is_valid(i):
+                opts.append(i)
+
+        return opts
+
     def do_action(self, act):
         state = self.get_current_state()
 
@@ -345,6 +406,7 @@ class GameController:
             else:
                 return False
 
+        self.get_current_state().inc_move_num()
         return True
 
     def loop_instance(self):
