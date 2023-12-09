@@ -36,82 +36,95 @@ class ReplayMemory(object):
         return len(self.memory)
 
 
-class DQN(nn.Module):
-    def __init__(self, n_observations, n_actions):
-        super(DQN, self).__init__()
-        self.layer1 = nn.Linear(n_observations, 128)
-        self.layer2 = nn.Linear(128, 256)
-        self.layer3 = nn.Linear(256, 512)
+class ResidualBlock(nn.Module):
+    def __init__(self, classifications, internal_size):
+        super(ResidualBlock, self).__init__()
 
-        # Residual Block 1
-        self.layer4 = nn.Linear(512, 512)
-        self.layer5 = nn.Linear(512, 512)
-        self.layer6 = nn.Linear(512, 512)
+        self.internal_size = internal_size
+        self.classifications = classifications
 
-        # Squeeze Layers
-        self.layer7 = nn.Linear(512, 1024)
+        self.layer1 = nn.Linear(internal_size, internal_size)
+        self.layer2 = nn.Linear(internal_size, internal_size)
 
-        self.dropout1 = nn.Dropout(0.2)
+        self.layer3 = nn.Linear(internal_size, (internal_size // 2) * 3)
+        self.dropout1 = nn.Dropout(0.5)
 
-        self.layer8 = nn.Linear(1024, 128)
-        self.layer9 = nn.Linear(128, 128)
-        self.layer10 = nn.Linear(128, 1024)
+        self.layer4 = nn.Linear((internal_size // 2) * 3, classifications)
+        self.layer5 = nn.Linear(classifications, classifications)
+        self.layer6 = nn.Linear(classifications, internal_size * 2)
 
-        self.dropout2 = nn.Dropout(0.2)
-
-        self.layer11 = nn.Linear(1024, 512)
-
-        # Residual Block 2
-        self.layer12 = nn.Linear(512, 512)
-        self.layer13 = nn.Linear(512, 512)
-        self.layer14 = nn.Linear(512, 512)
-
-        self.layer15 = nn.Linear(512, 256)
-        self.layer16 = nn.Linear(256, 128)
-        self.layer17 = nn.Linear(128, n_actions)
+        self.layer7 = nn.Linear(internal_size * 2, internal_size)
 
     def forward(self, x):
-        # Encode
-        x = F.relu(self.layer1(x))
-        x = F.relu(self.layer2(x))
+        x = F.relu(x + self.layer1(x))
+        x = F.relu(x + self.layer2(x))
         x = F.relu(self.layer3(x))
 
-        # Residual Block 1
-        x = F.relu(x + self.layer4(x))
-        x = F.relu(x + self.layer5(x))
-        x = F.relu(x + self.layer6(x))
-
-        # Squeeze Architecture
-        x = F.leaky_relu(self.layer7(x))
         x = self.dropout1(x)
+        x = F.sigmoid(self.layer4(x))
+        x = F.softmax(self.layer5(x))
 
-        x = F.leaky_relu(self.layer8(x))
-        x = F.softmax(self.layer9(x))
-        x = F.leaky_relu(self.layer10(x))
+        x = F.relu(self.layer6(x))
+        return F.relu(self.layer7(x))
 
-        x = self.dropout2(x)
-        x = F.leaky_relu(self.layer11(x))
+class ConcatenationBlock(nn.Module):
+    def __init__(self, internal_size):
+        super(ConcatenationBlock, self).__init__()
+        self.internal_size = internal_size
 
-        # Residual Block 2
-        x = F.relu(x + self.layer12(x))
-        x = F.relu(x + self.layer13(x))
-        x = F.relu(x + self.layer14(x))
+        self.layer = nn.Linear(self.internal_size * 2, self.internal_size)
 
-        # Decode
-        x = F.relu(self.layer15(x))
-        x = F.relu(self.layer16(x))
-        return F.softmax(self.layer17(x))
+    def forward(self, x):
+        return F.relu(self.layer(x))
+
+class DQN(nn.Module):
+    def __init__(self, n_observations, n_actions, internal_size=256, classifications=16, feature_amt=4):
+        super(DQN, self).__init__()
+        self.layer1 = nn.Linear(n_observations, internal_size // 2)
+        self.layer2 = nn.Linear(internal_size // 2, internal_size)
+
+        self.residual_amt = feature_amt
+        self.classification_count = classifications
+        self.res_block = []
+        self.concat_block = []
+
+        for i in range(self.residual_amt):
+            self.res_block.append(ResidualBlock(classifications, internal_size).cuda())
+            self.concat_block.append(ConcatenationBlock(internal_size).cuda())
+
+        self.layer3 = nn.Linear(internal_size * self.residual_amt, internal_size)
+        self.layer4 = nn.Linear(internal_size, internal_size // 2)
+        self.layer5 = nn.Linear(internal_size // 2, n_actions)
+
+    def forward(self, x):
+        # Input
+        x = F.relu(self.layer1(x))
+        x = F.relu(self.layer2(x))
+
+        res = []
+        for i in range(self.residual_amt):
+            p = self.res_block[i].forward(x)
+
+            q = torch.cat((x, p), 1)
+            x = self.concat_block[i].forward(q)
+
+            res.append(x.clone())
+
+        r = torch.cat(res, 1)
+        x = F.relu(self.layer3(r))
+        x = F.relu(self.layer4(x))
+        return self.layer5(x)
 
 
 BATCH_SIZE = 512
 
 # Larger gamma -> Future Reward is more important
-GAMMA = 0.4
+GAMMA = 0.999
 
 # What amount of sampled actions are random ... and at what rate does this decay?
 EPS_START = 0.9
 EPS_END = 0.0001
-EPS_DECAY = 12288
+EPS_DECAY = 16384
 
 # Target Net Update Rate
 TAU = 0.01
@@ -134,11 +147,17 @@ n_actions = 64
 state = g_state.to_vector(0)
 n_observations = len(state)
 
-policy_net = DQN(n_observations, n_actions).to(device)
-target_net = DQN(n_observations, n_actions).to(device)
+internal_size = 256
+classifications = 64
+feature_amt = 6
+
+policy_net = DQN(n_observations, n_actions, internal_size, classifications, feature_amt).to(device)
+target_net = DQN(n_observations, n_actions, internal_size, classifications, feature_amt).to(device)
 target_net.load_state_dict(policy_net.state_dict())
 
-summary(policy_net, (64, 1, n_observations))
+summary(ResidualBlock(classifications, internal_size), (1, internal_size))
+summary(ConcatenationBlock(internal_size), (1, internal_size * 2))
+summary(policy_net, (1, n_observations))
 
 steps = 10
 optimizer = optim.AdamW(policy_net.parameters(), lr=LR, amsgrad=True)
@@ -214,24 +233,24 @@ def optimize_model():
 
     return True
 
-coeff_chaos = 1
-coeff_move = 3
-coeff_farkle = 1.5
-coeff_hold = 2
+coeff_punish = 0
+coeff_chaos = 0
+coeff_move = 0
+coeff_hold = 1
 
 def train(num_episodes):
     global BATCH_SIZE
 
-    accumulated_score = 0
-
     scores_sampler = []
     moves_sampler = []
-    delta_sampler = []
     highest_sampler = []
+    did_farkle_sampler = []
+    delta_no_farkle_sampler = []
+    did_hold_sampler = []
 
     start = timer()
 
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, int(num_episodes/4), 2)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, int(num_episodes/32), 1)
     for i_episode in range(num_episodes):
 
         g_control.get_current_state().accrue_total_score_and_reset_state()
@@ -242,8 +261,9 @@ def train(num_episodes):
         finish_score = g_control.get_current_state().get_hand_score()[0]
         highest_score = g_control.get_current_state().get_hand_score()[0]
 
-        hold_count = 0
         total_reward = 0
+
+        div_amt = 128
 
         moves = 0
 
@@ -269,12 +289,11 @@ def train(num_episodes):
 
             if action == 0:
                 finish_score = state_old.get_round_score() + state_old.get_hand_score()[0]
-                reward = (dealt_score - finish_score) * coeff_hold
-                reward = reward * moves**coeff_chaos - coeff_chaos * 100
+                reward = finish_score/8000
                 finished = True
 
             elif g_control.get_current_state().get_hand_score()[0] == 0:
-                reward = -(finish_score * coeff_farkle) * (1 + coeff_chaos)**moves
+                reward = -1
                 finish_score = 0
                 finished = True
 
@@ -283,7 +302,6 @@ def train(num_episodes):
 
             moves += 1
 
-            reward = reward / 8000
             total_reward += reward
             reward = torch.tensor([reward], device=device)
 
@@ -314,47 +332,51 @@ def train(num_episodes):
 
         #print(string)
 
-        if i_episode % (num_episodes / 16) == 0:
-            print(round(i_episode/num_episodes * 100, 2))
-            print(scheduler.get_last_lr())
-            end = timer()
-            print("TIME: ", timedelta(seconds=end - start))
-
-        accumulated_score += finish_score
-
         scores_sampler.append(finish_score)
         moves_sampler.append(moves)
-        delta_sampler.append(finish_score - dealt_score)
+
         highest_sampler.append(highest_score)
 
-    end = timer()
-    print("TIME: ", timedelta(seconds=end - start))
+        if moves == 1:
+            did_hold_sampler.append(1)
+        else:
+            did_hold_sampler.append(0)
 
-    print("AVERAGE SCORE: ", accumulated_score / num_episodes)
+        if finish_score == 0:
+            did_farkle_sampler.append(1)
+        else:
+            delta_no_farkle_sampler.append(finish_score - dealt_score)
+            did_farkle_sampler.append(0)
 
-    fig, axs = plt.subplots(2, 2)
+        if i_episode % 512 == 0:
+            end = timer()
+            t_delta = timedelta(seconds=end - start)
+            print(round(i_episode/num_episodes * 100, 2), "%", "- [ t:", t_delta, "] -> lr:", scheduler.get_last_lr())
 
-    # axs[0, 0].plot(np.array(scores_sampler))
-    # axs[0, 0].plot(np.array(moving_average(scores_sampler, 128)), 'tab:purple')
-    axs[0, 0].plot(np.array(moving_average(scores_sampler, 1024)[::32]))
-    axs[0, 0].set_title('Final Scores')
+            if i_episode > 512:
+                fig, axs = plt.subplots(3, 2, figsize=(16,12))
+                axs[0, 0].plot(np.array(moving_average(scores_sampler, div_amt * 4)[::64]))
+                axs[0, 0].set_title('Final Scores')
 
-    # axs[0, 1].plot(np.array(highest_sampler), 'tab:orange')
-    # axs[0, 1].plot(np.array(moving_average(highest_sampler, 128)), 'tab:purple')
-    axs[0, 1].plot(np.array(moving_average(highest_sampler, 1024)[::32]), 'tab:orange')
-    axs[0, 1].set_title('Highest Scores')
+                axs[0, 1].plot(np.array(moving_average(highest_sampler, div_amt * 4)[::64]), 'tab:orange')
+                axs[0, 1].set_title('Highest Scores')
 
-    # axs[1, 0].plot(np.array(delta_sampler), 'tab:green')
-    # axs[1, 0].plot(np.array(moving_average(delta_sampler, 128)), 'tab:purple')
-    axs[1, 0].plot(np.array(moving_average(delta_sampler, 1024)[::32]), 'tab:green')
-    axs[1, 0].set_title('Delta Scores')
+                axs[1, 0].plot(np.array(moving_average(delta_no_farkle_sampler, div_amt * 4)[::64]), 'tab:green')
+                axs[1, 0].set_title('Delta Scores [No Farkle]')
 
-    # axs[1, 1].plot(np.array(moves_sampler), 'tab:red')
-    # axs[1, 1].plot(np.array(moving_average(moves_sampler, 128)), 'tab:purple')
-    axs[1, 1].plot(np.array(moving_average(moves_sampler, 1024)[::32]), 'tab:red')
-    axs[1, 1].set_title('Move Count')
+                axs[1, 1].plot(np.array(moving_average(moves_sampler, div_amt * 4)[::64]), 'tab:red')
+                axs[1, 1].set_title('Move Count')
 
-    plt.show()
+                axs[2, 0].plot(np.array(moving_average(did_farkle_sampler, div_amt * 4)[::64]), 'tab:green')
+                axs[2, 0].set_title('Farkle Freq.')
+
+                axs[2, 1].plot(np.array(moving_average(did_hold_sampler, div_amt * 4)[::64]), 'tab:red')
+                axs[2, 1].set_title('Hold Freq.')
+
+                div_amt += 128
+
+                plt.savefig('plots/plot_' + str(t_delta).split(".")[0].replace(':', '-') + '.png')
+                plt.close(fig)
 
 
 class SimpleAIActor(Actor):
